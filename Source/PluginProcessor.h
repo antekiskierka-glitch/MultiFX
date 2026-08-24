@@ -3,11 +3,13 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "DSP/Distortion.h"
 #include "DSP/FrequencyShifter.h"
+#include "DSP/Granulizer.h"
 #include "HorrorLabDSP.h"
 #include "DSP/MultibandReverb.h"
 #include "DSP/PitchShifter.h"
@@ -46,7 +48,40 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    // Wildcard list for the formats the current JUCE build registered,
+    // e.g. "*.wav;*.aiff;*.mp3".
+    juce::String getSupportedFileWildcard() const;
+
+    // Message thread only. Decodes the file, then swaps it into the engine
+    // under the callback lock so the audio thread never sees a partial buffer.
+    bool loadGranularFile(const juce::File&);
+    juce::String getGranularStatus() const { return granularStatus; }
+
+    // Peak envelope of the loaded file, or of the live buffer in live mode.
+    void copyGranularPreview(std::vector<float>& destination) const;
+
+    bool hasGranularFile() const;
+    float getGranularPlayhead() const { return granulizer.getPlayheadPosition(); }
+    bool isGranularPlaying() const { return granulizer.isPlaying(); }
+
+    void stopGranular();
+    void startGranular();
+
+    // Renders the whole loaded file through a private engine copy configured
+    // with the current settings, then writes a WAV. Runs on a background
+    // thread, so the audio callback is never blocked by rendering or file I/O.
+    // shouldAbort lets a closing editor cancel a long render promptly.
+    bool exportGranularToFile(const juce::File& destination, juce::String& errorMessage,
+        const std::function<bool()>& shouldAbort = {});
+
 private:
+    juce::AudioFormatManager formatManager;
+    juce::AudioBuffer<float> granularFileBuffer;
+    double granularFileSampleRate = 44100.0;
+    juce::String granularStatus { "No file loaded" };
+    std::vector<float> filePreview;
+    Granulizer granulizer;
+
     std::vector<FrequencyShifter> frequencyShifters;
     std::vector<WowProcessor> wowProcessors;
     std::vector<Squeezer> squeezers;
