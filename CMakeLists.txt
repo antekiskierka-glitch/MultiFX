@@ -60,10 +60,17 @@ target_compile_definitions(MultiFX
         JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0
+        # Grain source file loading. MP3 uses JUCE's built-in decoder, so no
+        # extra dependency is required.
+        JUCE_USE_WINDOWS_MEDIA_FORMAT=0
+        JUCE_USE_MP3AUDIOFORMAT=1
+        JUCE_USE_OGGVORBIS=0
+        JUCE_USE_FLAC=0
 )
 
 target_link_libraries(MultiFX
     PRIVATE
+        juce::juce_audio_formats
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC

@@ -8,6 +8,7 @@
 
 #include "DSP/Distortion.h"
 #include "DSP/FrequencyShifter.h"
+#include "DSP/Granulizer.h"
 #include "HorrorLabDSP.h"
 #include "DSP/MultibandReverb.h"
 #include "DSP/PitchShifter.h"
@@ -46,7 +47,26 @@ public:
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    // Wildcard list for the formats the current JUCE build registered,
+    // e.g. "*.wav;*.aiff;*.mp3".
+    juce::String getSupportedFileWildcard() const;
+
+    // Message thread only. Decodes the file, then swaps it into the engine
+    // under the callback lock so the audio thread never sees a partial buffer.
+    bool loadGranularFile(const juce::File&);
+    juce::String getGranularStatus() const { return granularStatus; }
+
+    // Peak envelope of the loaded file, or of the live buffer in live mode.
+    void copyGranularPreview(std::vector<float>& destination) const;
+
 private:
+    juce::AudioFormatManager formatManager;
+    juce::AudioBuffer<float> granularFileBuffer;
+    double granularFileSampleRate = 44100.0;
+    juce::String granularStatus { "No file loaded" };
+    std::vector<float> filePreview;
+    Granulizer granulizer;
+
     std::vector<FrequencyShifter> frequencyShifters;
     std::vector<WowProcessor> wowProcessors;
     std::vector<Squeezer> squeezers;

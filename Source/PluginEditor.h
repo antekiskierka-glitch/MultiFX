@@ -87,6 +87,43 @@ struct EffectSection : juce::Component
     std::vector<std::unique_ptr<KnobWithLabel>> knobs;
 };
 
+// Peak-envelope preview of the live circular buffer or the loaded file.
+struct WaveformDisplay : juce::Component
+{
+    void paint(juce::Graphics&) override;
+    void setPeaks(const std::vector<float>& newPeaks) { peaks = newPeaks; repaint(); }
+
+    std::vector<float> peaks;
+};
+
+struct GranularPage : juce::Component, juce::FileDragAndDropTarget
+{
+    explicit GranularPage(MultiFXAudioProcessor&);
+
+    void paint(juce::Graphics&) override;
+    void resized() override;
+    void refresh();
+
+    bool isInterestedInFileDrag(const juce::StringArray&) override;
+    void filesDropped(const juce::StringArray&, int, int) override;
+
+    MultiFXAudioProcessor& processorRef;
+    juce::ToggleButton enable;
+    IlluminatedButton liveButton, fileButton, loadButton;
+    juce::Label status;
+    WaveformDisplay waveform;
+    std::vector<std::unique_ptr<KnobWithLabel>> knobs;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enableAttachment;
+    std::unique_ptr<juce::FileChooser> chooser;
+
+private:
+    void setSourceMode(bool useFile);
+    void loadFile(const juce::File&);
+
+    juce::AudioParameterChoice* sourceParameter = nullptr;
+    std::vector<float> previewScratch;
+};
+
 class MultiFXAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
@@ -104,7 +141,7 @@ private:
     FreakLookAndFeel freakLookAndFeel;
     juce::Image background;
     IlluminatedButton horrorButton, fxButton, granularButton;
-    juce::Label granularPlaceholder;
+    GranularPage granularPage;
     Page currentPage = Page::fx;
     float animationPhase = 0.0f;
     EffectSection distortionSection, cassetteSection, pitchSection, wowSection, chorusSection, flangerSection,
