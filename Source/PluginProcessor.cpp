@@ -86,11 +86,129 @@ bool MultiFXAudioProcessor::loadGranularFile(const juce::File& file)
         granulizer.setFileSource(&granularFileBuffer, granularFileSampleRate);
     }
 
+    granulizer.requestStart();
     filePreview = std::move(preview);
     granularStatus = file.getFileName() + "  |  "
         + juce::String(numSamples / reader->sampleRate, 2) + "s  "
         + juce::String((int)reader->sampleRate) + "Hz  "
         + juce::String(numChannels) + "ch";
+    return true;
+}
+
+bool MultiFXAudioProcessor::hasGranularFile() const
+{
+    return granularFileBuffer.getNumSamples() >= 4;
+}
+
+void MultiFXAudioProcessor::stopGranular()
+{
+    granulizer.requestStop();
+}
+
+void MultiFXAudioProcessor::startGranular()
+{
+    granulizer.requestStart();
+}
+
+bool MultiFXAudioProcessor::exportGranularToFile(const juce::File& destination, juce::String& errorMessage,
+    const std::function<bool()>& shouldAbort)
+{
+    juce::AudioBuffer<float> source;
+    double sourceSampleRate = 44100.0;
+    Granulizer::Settings settings;
+
+    // Snapshot the file and settings under the callback lock so a concurrent
+    // load can't swap the buffer out from under the render, and so the settings
+    // aren't torn by the audio thread updating them mid-copy.
+    {
+        const juce::ScopedLock callbackLock(getCallbackLock());
+
+        if (granularFileBuffer.getNumSamples() < 4)
+        {
+            errorMessage = "No file loaded";
+            return false;
+        }
+
+        source.makeCopyOf(granularFileBuffer, true);
+        sourceSampleRate = granularFileSampleRate;
+        settings = granulizer.getSettings();
+    }
+
+    // A private engine instance means the render can't disturb the live one and
+    // needs no locking against the audio thread.
+    Granulizer offline;
+    offline.prepare(sourceSampleRate, source.getNumChannels());
+    offline.setSettings(settings);
+    offline.setSourceMode(Granulizer::SourceMode::file);
+    offline.setFileSource(&source, sourceSampleRate);
+    offline.setActive(true);
+    offline.requestStart();
+
+    const int numSamples = source.getNumSamples();
+    const int numChannels = source.getNumChannels();
+    juce::AudioBuffer<float> rendered(numChannels, numSamples);
+    rendered.clear();
+
+    // Feed the dry file through in blocks so the wet/dry mix control behaves
+    // exactly as it does live.
+    constexpr int blockSize = 512;
+
+    juce::AudioBuffer<float> block(numChannels, blockSize);
+
+    for (int offset = 0; offset < numSamples; offset += blockSize)
+    {
+        if (shouldAbort && shouldAbort())
+        {
+            errorMessage = "Cancelled";
+            return false;
+        }
+
+        const int thisBlock = juce::jmin(blockSize, numSamples - offset);
+        block.setSize(numChannels, thisBlock, false, false, true);
+
+        for (int c = 0; c < numChannels; ++c)
+            block.copyFrom(c, 0, source, c, offset, thisBlock);
+
+        offline.process(block);
+
+        for (int c = 0; c < numChannels; ++c)
+            rendered.copyFrom(c, offset, block, c, 0, thisBlock);
+    }
+
+    if (!destination.getParentDirectory().createDirectory() && !destination.getParentDirectory().isDirectory())
+    {
+        errorMessage = "Cannot write to that folder";
+        return false;
+    }
+
+    destination.deleteFile();
+    std::unique_ptr<juce::FileOutputStream> stream(destination.createOutputStream());
+
+    if (stream == nullptr)
+    {
+        errorMessage = "Cannot create " + destination.getFileName();
+        return false;
+    }
+
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        wav.createWriterFor(stream.get(), sourceSampleRate, (unsigned int)numChannels, 24, {}, 0));
+
+    if (writer == nullptr)
+    {
+        errorMessage = "Cannot encode WAV";
+        return false;
+    }
+
+    stream.release();
+
+    if (!writer->writeFromAudioSampleBuffer(rendered, 0, numSamples))
+    {
+        errorMessage = "Write failed";
+        return false;
+    }
+
+    writer.reset();
     return true;
 }
 

@@ -45,18 +45,54 @@ public:
 
         for (auto& p : previewPeaks)
             p.store(0.0f);
+
+        stopRequested.store(false);
+        playing.store(true);
+        playhead.store(-1.0f);
     }
 
+    // Grouped so the offline renderer can copy the live settings verbatim and
+    // produce an export that matches what the user is hearing.
+    struct Settings
+    {
+        SourceMode sourceMode = SourceMode::live;
+        float attackMs = 20.0f;
+        float holdMs = 120.0f;
+        float spacingMs = 60.0f;
+        float speed = 1.0f;
+        float panSpread = 0.35f;
+        float depth = 0.5f;
+        float randomAmount = 0.25f;
+        float mix = 0.5f;
+    };
+
     void setActive(bool shouldRenderGrains) noexcept { active = shouldRenderGrains; }
-    void setSourceMode(SourceMode mode) noexcept { sourceMode = mode; }
-    void setAttackMs(float value) noexcept { attackMs = std::clamp(value, 1.0f, 500.0f); }
-    void setHoldMs(float value) noexcept { holdMs = std::clamp(value, 5.0f, 1000.0f); }
-    void setSpacingMs(float value) noexcept { spacingMs = std::clamp(value, 5.0f, 500.0f); }
-    void setSpeed(float value) noexcept { speed = std::clamp(value, 0.25f, 4.0f); }
-    void setPan(float value) noexcept { panSpread = std::clamp(value, 0.0f, 1.0f); }
-    void setDepth(float value) noexcept { depth = std::clamp(value, 0.0f, 1.0f); }
-    void setRandom(float value) noexcept { randomAmount = std::clamp(value, 0.0f, 1.0f); }
-    void setMix(float value) noexcept { mix = std::clamp(value, 0.0f, 1.0f); }
+    void setSourceMode(SourceMode mode) noexcept { settings.sourceMode = mode; }
+    void setAttackMs(float value) noexcept { settings.attackMs = std::clamp(value, 1.0f, 500.0f); }
+    void setHoldMs(float value) noexcept { settings.holdMs = std::clamp(value, 5.0f, 1000.0f); }
+    void setSpacingMs(float value) noexcept { settings.spacingMs = std::clamp(value, 5.0f, 500.0f); }
+    void setSpeed(float value) noexcept { settings.speed = std::clamp(value, 0.25f, 4.0f); }
+    void setPan(float value) noexcept { settings.panSpread = std::clamp(value, 0.0f, 1.0f); }
+    void setDepth(float value) noexcept { settings.depth = std::clamp(value, 0.0f, 1.0f); }
+    void setRandom(float value) noexcept { settings.randomAmount = std::clamp(value, 0.0f, 1.0f); }
+    void setMix(float value) noexcept { settings.mix = std::clamp(value, 0.0f, 1.0f); }
+
+    Settings getSettings() const noexcept { return settings; }
+    void setSettings(const Settings& s) noexcept { settings = s; }
+
+    // Asks the audio thread to silence and release every sounding grain at the
+    // start of its next block. Safe to call from any thread.
+    void requestStop() noexcept { stopRequested.store(true); }
+
+    // Playback resumes on the next explicit start, e.g. loading a file or
+    // changing source mode, so Stop stays stopped until the user acts.
+    void requestStart() noexcept { stopRequested.store(false); playing.store(true); }
+    bool isPlaying() const noexcept { return playing.load(); }
+
+    // Normalised grain read position for the editor's playhead: position within
+    // the file in file mode, or within the visible preview span in live mode.
+    // Negative means nothing is sounding, so the editor can hide the marker.
+    float getPlayheadPosition() const noexcept { return playhead.load(); }
 
     // Called from the audio thread only; the buffer stays alive for as long as
     // the processor holds its reference, so storing the raw pointer is safe.
@@ -76,11 +112,24 @@ public:
             return;
 
         const juce::AudioBuffer<float>* file = fileBuffer;
-        const bool useFile = sourceMode == SourceMode::file;
+        const bool useFile = settings.sourceMode == SourceMode::file;
+
+        // Honour a pending Stop before rendering: release every sounding grain
+        // and drop the playhead so the marker disappears immediately.
+        if (stopRequested.exchange(false))
+        {
+            for (auto& g : grains)
+                g.active = false;
+
+            samplesUntilNextGrain = 0;
+            playing.store(false);
+            playhead.store(-1.0f);
+        }
 
         // File mode without a usable buffer still records into the live buffer
         // so the preview keeps scrolling; it just renders no grains.
-        const bool renderGrains = active && (!useFile || (file != nullptr && file->getNumSamples() >= 4));
+        const bool renderGrains = active && playing.load()
+            && (!useFile || (file != nullptr && file->getNumSamples() >= 4));
 
         float* liveLeft = liveBuffer.getWritePointer(0);
         float* liveRight = channels > 1 ? liveBuffer.getWritePointer(1) : liveLeft;
@@ -159,14 +208,16 @@ public:
 
             if (outRight != nullptr)
             {
-                outLeft[i] = inLeft * (1.0f - mix) + wetLeft * mix;
-                outRight[i] = inRight * (1.0f - mix) + wetRight * mix;
+                outLeft[i] = inLeft * (1.0f - settings.mix) + wetLeft * settings.mix;
+                outRight[i] = inRight * (1.0f - settings.mix) + wetRight * settings.mix;
             }
             else
             {
-                outLeft[i] = inLeft * (1.0f - mix) + (wetLeft + wetRight) * 0.5f * mix;
+                outLeft[i] = inLeft * (1.0f - settings.mix) + (wetLeft + wetRight) * 0.5f * settings.mix;
             }
         }
+
+        publishPlayhead(file, liveLength, renderGrains);
     }
 
     // Scrolling peak envelope of the live buffer, for the editor's preview.
@@ -222,7 +273,7 @@ private:
 
     int spacingInSamples() const noexcept
     {
-        return std::max(16, (int)(spacingMs * 0.001f * (float)sr));
+        return std::max(16, (int)(settings.spacingMs * 0.001f * (float)sr));
     }
 
     int msToSamples(float milliseconds) const noexcept
@@ -252,21 +303,21 @@ private:
         if (grain == nullptr)
             return;
 
-        const float positionJitter = nextRandomBipolar() * randomAmount;
+        const float positionJitter = nextRandomBipolar() * settings.randomAmount;
         const double rate = std::clamp(
-            (double)speed * std::pow(2.0, (double)(nextRandomBipolar() * randomAmount) * 7.0 / 12.0),
+            (double)settings.speed * std::pow(2.0, (double)(nextRandomBipolar() * settings.randomAmount) * 7.0 / 12.0),
             0.05, 8.0);
 
-        int attack = std::max(1, msToSamples(attackMs));
-        int hold = std::max(0, msToSamples(holdMs));
+        int attack = std::max(1, msToSamples(settings.attackMs));
+        int hold = std::max(0, msToSamples(settings.holdMs));
 
-        if (sourceMode == SourceMode::file)
+        if (settings.sourceMode == SourceMode::file)
         {
             if (file == nullptr || file->getNumSamples() < 4)
                 return;
 
             const double length = (double)file->getNumSamples();
-            double position = std::fmod((double)depth * length + (double)positionJitter * length * 0.5, length);
+            double position = std::fmod((double)settings.depth * length + (double)positionJitter * length * 0.5, length);
             if (position < 0.0)
                 position += length;
 
@@ -312,7 +363,7 @@ private:
             const double lowest = minMargin + (rate > 1.0 ? travel : 0.0);
             const double highest = minMargin + window - (rate > 1.0 ? 0.0 : travel);
             const double span = std::max(0.0, highest - lowest);
-            const double normalised = std::clamp((double)depth + (double)positionJitter * 0.5, 0.0, 1.0);
+            const double normalised = std::clamp((double)settings.depth + (double)positionJitter * 0.5, 0.0, 1.0);
 
             double position = (double)writePos - (lowest + normalised * span);
             while (position < 0.0)
@@ -323,7 +374,7 @@ private:
             grain->increment = rate;
         }
 
-        const float pan = std::clamp(0.5f + nextRandomBipolar() * panSpread * 0.5f, 0.0f, 1.0f);
+        const float pan = std::clamp(0.5f + nextRandomBipolar() * settings.panSpread * 0.5f, 0.0f, 1.0f);
         const float overlap = std::max(1.0f, (float)(attack * 2 + hold) / (float)spacingInSamples());
         const float gain = 1.0f / std::sqrt(overlap);
 
@@ -334,6 +385,51 @@ private:
         grain->gainLeft = std::cos(pan * juce::MathConstants<float>::halfPi) * gain;
         grain->gainRight = std::sin(pan * juce::MathConstants<float>::halfPi) * gain;
         grain->active = true;
+    }
+
+    // Reports the youngest sounding grain, which is the one the ear tracks, as
+    // a 0..1 position in whichever source the preview is currently drawing.
+    void publishPlayhead(const juce::AudioBuffer<float>* file, int liveLength, bool renderGrains) noexcept
+    {
+        if (!renderGrains)
+        {
+            playhead.store(-1.0f);
+            return;
+        }
+
+        const Grain* newest = nullptr;
+
+        for (const auto& g : grains)
+            if (g.active && (newest == nullptr || g.age < newest->age))
+                newest = &g;
+
+        if (newest == nullptr)
+        {
+            playhead.store(-1.0f);
+            return;
+        }
+
+        if (newest->fromFile)
+        {
+            if (file == nullptr || file->getNumSamples() < 4)
+            {
+                playhead.store(-1.0f);
+                return;
+            }
+
+            playhead.store(std::clamp((float)(newest->readPos / (double)file->getNumSamples()), 0.0f, 1.0f));
+            return;
+        }
+
+        // The live preview is drawn oldest-to-newest across its span, so map the
+        // grain's distance behind the write head onto that same span.
+        const double previewSpan = (double)previewPoints * (double)previewHopSamples;
+        double behind = (double)writePos - newest->readPos;
+
+        if (behind < 0.0)
+            behind += (double)liveLength;
+
+        playhead.store(std::clamp(1.0f - (float)(behind / previewSpan), 0.0f, 1.0f));
     }
 
     void pushPreview(float magnitude) noexcept
@@ -353,16 +449,11 @@ private:
     double sr = 44100.0;
     int channels = 2;
     bool active = false;
-    SourceMode sourceMode = SourceMode::live;
+    Settings settings;
 
-    float attackMs = 20.0f;
-    float holdMs = 120.0f;
-    float spacingMs = 60.0f;
-    float speed = 1.0f;
-    float panSpread = 0.35f;
-    float depth = 0.5f;
-    float randomAmount = 0.25f;
-    float mix = 0.5f;
+    std::atomic<bool> stopRequested { false };
+    std::atomic<bool> playing { true };
+    std::atomic<float> playhead { -1.0f };
 
     // Depth sweeps at most this far back, so it stays musically useful instead
     // of mapping across the whole (much longer) circular buffer.

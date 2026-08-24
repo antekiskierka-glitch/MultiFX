@@ -48,16 +48,19 @@ struct IlluminatedButton : juce::TextButton
     void paintButton(juce::Graphics& g, bool over, bool down) override
     {
         auto b = getLocalBounds().toFloat().reduced(1.0f);
+        const bool off = !isEnabled();
         auto fill = getToggleState() ? juce::Colour(0xff6b3038) : juce::Colour(0xff211d20);
-        if (over) fill = fill.brighter(0.10f);
-        if (down) fill = fill.darker(0.14f);
+        if (over && !off) fill = fill.brighter(0.10f);
+        if (down && !off) fill = fill.darker(0.14f);
         g.setColour(juce::Colour(0xff0c0a0c));
         g.fillRoundedRectangle(b.translated(1.0f, 1.5f), 3.0f);
-        g.setColour(fill);
+        g.setColour(off ? fill.withMultipliedSaturation(0.35f).darker(0.35f) : fill);
         g.fillRoundedRectangle(b, 3.0f);
-        g.setColour(getToggleState() ? juce::Colour(0xffb8aa8d) : juce::Colour(0xff655c5e));
+        auto outline = getToggleState() ? juce::Colour(0xffb8aa8d) : juce::Colour(0xff655c5e);
+        g.setColour(off ? outline.withAlpha(0.35f) : outline);
         g.drawRoundedRectangle(b, 3.0f, 1.0f);
-        g.setColour(getToggleState() ? juce::Colour(0xffeee0bd) : juce::Colour(0xffa79a82));
+        auto text = getToggleState() ? juce::Colour(0xffeee0bd) : juce::Colour(0xffa79a82);
+        g.setColour(off ? text.withAlpha(0.40f) : text);
         g.setFont(juce::Font(10.0f, juce::Font::bold));
         g.drawFittedText(getButtonText(), getLocalBounds().reduced(3), juce::Justification::centred, 1);
     }
@@ -87,29 +90,44 @@ struct EffectSection : juce::Component
     std::vector<std::unique_ptr<KnobWithLabel>> knobs;
 };
 
-// Peak-envelope preview of the live circular buffer or the loaded file.
+// Peak-envelope preview of the live circular buffer or the loaded file, with an
+// animated playhead marking the current grain read position.
 struct WaveformDisplay : juce::Component
 {
     void paint(juce::Graphics&) override;
-    void setPeaks(const std::vector<float>& newPeaks) { peaks = newPeaks; repaint(); }
+    void setPeaks(const std::vector<float>& newPeaks) { peaks = newPeaks; }
+
+    // Negative hides the marker. phase drives the pulse so the playhead reads as
+    // moving even while parked on sustained material.
+    void setPlayhead(float normalisedPosition, float phase)
+    {
+        playhead = normalisedPosition;
+        pulsePhase = phase;
+    }
 
     std::vector<float> peaks;
+    float playhead = -1.0f;
+    float pulsePhase = 0.0f;
 };
 
 struct GranularPage : juce::Component, juce::FileDragAndDropTarget
 {
     explicit GranularPage(MultiFXAudioProcessor&);
+    ~GranularPage() override;
 
     void paint(juce::Graphics&) override;
     void resized() override;
-    void refresh();
+
+    // Called from the editor's timer: refreshes the preview, playhead and the
+    // enabled/disabled state of the file-only controls.
+    void refresh(float animationPhase);
 
     bool isInterestedInFileDrag(const juce::StringArray&) override;
     void filesDropped(const juce::StringArray&, int, int) override;
 
     MultiFXAudioProcessor& processorRef;
     juce::ToggleButton enable;
-    IlluminatedButton liveButton, fileButton, loadButton;
+    IlluminatedButton liveButton, fileButton, loadButton, stopButton, exportButton;
     juce::Label status;
     WaveformDisplay waveform;
     std::vector<std::unique_ptr<KnobWithLabel>> knobs;
@@ -117,11 +135,32 @@ struct GranularPage : juce::Component, juce::FileDragAndDropTarget
     std::unique_ptr<juce::FileChooser> chooser;
 
 private:
+    // Renders and writes the WAV on a background thread so neither the audio
+    // callback nor the message thread stalls on a long export. It holds the
+    // processor (which outlives the editor) plus a SafePointer for the UI hop,
+    // so a closing editor can never leave the render on a dangling page.
+    struct ExportJob : juce::Thread
+    {
+        ExportJob(MultiFXAudioProcessor& p, GranularPage& page, const juce::File& d)
+            : juce::Thread("MultiFX Granular Export"), processor(p), owner(&page), destination(d) {}
+
+        void run() override;
+
+        MultiFXAudioProcessor& processor;
+        juce::Component::SafePointer<GranularPage> owner;
+        juce::File destination;
+    };
+
     void setSourceMode(bool useFile);
     void loadFile(const juce::File&);
+    void beginExport();
+    void exportFinished(bool succeeded, const juce::String& error, const juce::File&);
+    void updateTransportState();
 
     juce::AudioParameterChoice* sourceParameter = nullptr;
     std::vector<float> previewScratch;
+    std::unique_ptr<ExportJob> exportJob;
+    juce::String transportMessage;
 };
 
 class MultiFXAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer

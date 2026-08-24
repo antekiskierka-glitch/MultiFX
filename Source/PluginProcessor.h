@@ -3,6 +3,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -58,6 +59,20 @@ public:
 
     // Peak envelope of the loaded file, or of the live buffer in live mode.
     void copyGranularPreview(std::vector<float>& destination) const;
+
+    bool hasGranularFile() const;
+    float getGranularPlayhead() const { return granulizer.getPlayheadPosition(); }
+    bool isGranularPlaying() const { return granulizer.isPlaying(); }
+
+    void stopGranular();
+    void startGranular();
+
+    // Renders the whole loaded file through a private engine copy configured
+    // with the current settings, then writes a WAV. Runs on a background
+    // thread, so the audio callback is never blocked by rendering or file I/O.
+    // shouldAbort lets a closing editor cancel a long render promptly.
+    bool exportGranularToFile(const juce::File& destination, juce::String& errorMessage,
+        const std::function<bool()>& shouldAbort = {});
 
 private:
     juce::AudioFormatManager formatManager;
